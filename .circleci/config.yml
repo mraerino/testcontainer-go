@@ -1,0 +1,30 @@
+version: 2
+jobs:
+  build:
+    working_directory: /go/src/github.com/testcontainers/testcontainer-go
+    docker:
+      - image: golang:1.11
+    steps:
+      - checkout
+      - setup_remote_docker:
+          docker_layer_caching: true
+      - restore_cache:
+          keys:
+            - vendor-go-{{ .Branch }}-{{ .Revision }}
+            - vendor-go-{{ .Branch }}-
+            - vendor-go-
+      - run:
+          name: Install dep
+          command: go get -u github.com/golang/dep/cmd/dep
+          no_output_timeout: 20s
+      - run:
+          name: Solve dependencies
+          command: dep ensure
+          no_output_timeout: 20s
+      - save_cache:
+          key: vendor-go-{{ .Branch }}-{{ .Revision }}
+          paths:
+            - "vendor"
+      - run:
+          name: Execute test
+          command: go test ./...
