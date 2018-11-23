@@ -75,7 +75,7 @@ func (c *Container) GetIPAddress(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return inspect.NetworkSettings.IPAddress, nil
+	return inspect.NetworkSettings.Gateway, nil
 }
 
 // GetHostEndpoint returns the IP address and the port exposed on the host machine.
@@ -90,6 +90,11 @@ func (c *Container) GetHostEndpoint(ctx context.Context, port string) (string, s
 		return "", "", err
 	}
 
+	ip, err := c.GetIPAddress(ctx)
+	if err != nil {
+		return "", "", err
+	}
+
 	for p := range portSet {
 		ports, ok := inspect.NetworkSettings.Ports[p]
 		if !ok {
@@ -99,7 +104,7 @@ func (c *Container) GetHostEndpoint(ctx context.Context, port string) (string, s
 			return "", "", fmt.Errorf("port %s not found", port)
 		}
 
-		return ports[0].HostIP, ports[0].HostPort, nil
+		return ports[0].HostIP, ip, nil
 
 	}
 
@@ -107,7 +112,7 @@ func (c *Container) GetHostEndpoint(ctx context.Context, port string) (string, s
 }
 
 // Run is the function that starts the container. It can executed once
-func (c *Container) Run(ctx context.Context, waitFor wait.WaitStrategy) error {
+func (c *Container) Run(ctx context.Context) error {
 	cli, err := client.NewEnvClient()
 	if err != nil {
 		return err
@@ -119,10 +124,6 @@ func (c *Container) Run(ctx context.Context, waitFor wait.WaitStrategy) error {
 		return err
 	}
 	c.started = true
-
-	if err := waitFor.WaitUntilReady(ctx, c); err != nil {
-		return err
-	}
 	return nil
 }
 
