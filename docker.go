@@ -4,36 +4,38 @@ import (
 	"context"
 	"fmt"
 	"io/ioutil"
+	"strconv"
 	"strings"
-	"testing"
+
+	"github.com/pkg/errors"
+	uuid "github.com/satori/go.uuid"
+	"github.com/testcontainers/testcontainer-go/wait"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
 	"github.com/docker/go-connections/nat"
-	"github.com/testcontainers/testcontainer-go/wait"
 )
 
-// RequestContainer is the input object used to get a running container.
-type RequestContainer struct {
-	Env          map[string]string
-	ExportedPort []string
-	Cmd          string
-	RegistryCred string
-	WaitingFor   wait.WaitStrategy
-}
-
-// Container is the struct used to represent a single container.
-type Container struct {
+// DockerContainer represents a container started using Docker
+type DockerContainer struct {
 	// Container ID from Docker
-	ID string
+	ID         string
+	WaitingFor wait.WaitStrategy
+
+	sessionID uuid.UUID
 	// Cache to retrieve container infromation without re-fetching them from dockerd
-	raw    *types.ContainerJSON
-	client *client.Client
+	raw      *types.ContainerJSON
+	provider *DockerProvider
 }
 
-// LivenessCheckPorts returns the exposed ports for the container.
-func (c *Container) LivenessCheckPorts(ctx context.Context) (nat.PortSet, error) {
+// LivenessCheckPorts (deprecated) returns the exposed ports for the container.
+func (c *DockerContainer) LivenessCheckPorts(ctx context.Context) (nat.PortSet, error) {
+	return c.GetPorts(ctx)
+}
+
+// GetPorts returns the exposed ports for the container.
+func (c *DockerContainer) GetPorts(ctx context.Context) (nat.PortSet, error) {
 	inspect, err := c.inspectContainer(ctx)
 	if err != nil {
 		return nil, err
@@ -41,18 +43,48 @@ func (c *Container) LivenessCheckPorts(ctx context.Context) (nat.PortSet, error)
 	return inspect.Config.ExposedPorts, nil
 }
 
+func (c *DockerContainer) GetMappedPort(ctx context.Context, port uint16) (string, error) {
+	inspect, err := c.inspectContainer(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	for k, p := range inspect.NetworkSettings.Ports {
+		if k.Port() == strconv.Itoa(int(port)) {
+			return p[0].HostPort, nil
+		}
+	}
+	return "0", nil
+}
+
+// Start will start an already created container
+func (c *DockerContainer) Start(ctx context.Context) error {
+	if err := c.provider.client.ContainerStart(ctx, c.ID, types.ContainerStartOptions{}); err != nil {
+		return err
+	}
+
+	// if a WaitStrategy has been specified, wait before returning
+	if c.WaitingFor != nil {
+		if err := c.WaitingFor.WaitUntilReady(ctx, c); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 // Terminate is used to kill the container. It is usally triggered by as defer function.
-func (c *Container) Terminate(ctx context.Context, t *testing.T) error {
-	return c.client.ContainerRemove(ctx, c.ID, types.ContainerRemoveOptions{
+func (c *DockerContainer) Terminate(ctx context.Context) error {
+	return c.provider.client.ContainerRemove(ctx, c.ID, types.ContainerRemoveOptions{
 		Force: true,
 	})
 }
 
-func (c *Container) inspectContainer(ctx context.Context) (*types.ContainerJSON, error) {
+func (c *DockerContainer) inspectContainer(ctx context.Context) (*types.ContainerJSON, error) {
 	if c.raw != nil {
 		return c.raw, nil
 	}
-	inspect, err := c.client.ContainerInspect(ctx, c.ID)
+	inspect, err := c.provider.client.ContainerInspect(ctx, c.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -61,7 +93,7 @@ func (c *Container) inspectContainer(ctx context.Context) (*types.ContainerJSON,
 }
 
 // GetIPAddress returns the ip address for the running container.
-func (c *Container) GetIPAddress(ctx context.Context) (string, error) {
+func (c *DockerContainer) GetIPAddress(ctx context.Context) (string, error) {
 	inspect, err := c.inspectContainer(ctx)
 	if err != nil {
 		return "", err
@@ -70,68 +102,74 @@ func (c *Container) GetIPAddress(ctx context.Context) (string, error) {
 }
 
 // GetHostEndpoint returns the IP address and the port exposed on the host machine.
-func (c *Container) GetHostEndpoint(ctx context.Context, port string) (string, string, error) {
+func (c *DockerContainer) GetHostEndpoint(ctx context.Context, port string) (string, error) {
 	inspect, err := c.inspectContainer(ctx)
 	if err != nil {
-		return "", "", err
+		return "", err
 	}
 
 	portSet, _, err := nat.ParsePortSpecs([]string{port})
 	if err != nil {
-		return "", "", err
+		return "", err
 	}
 
 	for p := range portSet {
 		ports, ok := inspect.NetworkSettings.Ports[p]
 		if !ok {
-			return "", "", fmt.Errorf("port %s not found", port)
+			return "", fmt.Errorf("port %s not found", port)
 		}
 		if len(ports) == 0 {
-			return "", "", fmt.Errorf("port %s not found", port)
+			return "", fmt.Errorf("port %s not found", port)
 		}
 
-		return ports[0].HostIP, ports[0].HostPort, nil
+		return fmt.Sprintf("%s:%s", ports[0].HostIP, ports[0].HostPort), nil
 
 	}
 
-	return "", "", fmt.Errorf("port %s not found", port)
+	return "", fmt.Errorf("port %s not found", port)
 }
 
-// RunContainer takes a RequestContainer as input and it runs a container via the docker sdk
-func RunContainer(ctx context.Context, containerImage string, input RequestContainer) (*Container, error) {
-	cli, err := client.NewEnvClient()
-	if err != nil {
-		return nil, err
-	}
+type DockerProvider struct {
+	client *client.Client
+}
 
-	exposedPortSet, exposedPortMap, err := nat.ParsePortSpecs(input.ExportedPort)
+// CreateContainer fulfills a request for a container without starting it
+func (p *DockerProvider) CreateContainer(ctx context.Context, req ContainerRequest) (Container, error) {
+	exposedPortSet, exposedPortMap, err := nat.ParsePortSpecs(req.ExportedPort)
 	if err != nil {
 		return nil, err
 	}
 
 	env := []string{}
-	for envKey, envVar := range input.Env {
+	for envKey, envVar := range req.Env {
 		env = append(env, envKey+"="+envVar)
 	}
 
+	sessionID := uuid.NewV4()
+	r, err := NewReaper(ctx, sessionID.String(), p)
+	if err != nil {
+		return nil, errors.Wrap(err, "creating reaper failed")
+	}
+
 	dockerInput := &container.Config{
-		Image:        containerImage,
+		Image:        req.Image,
 		Env:          env,
 		ExposedPorts: exposedPortSet,
+		Labels:       r.GetLabels(),
 	}
 
-	if input.Cmd != "" {
-		dockerInput.Cmd = strings.Split(input.Cmd, " ")
+	if req.Cmd != "" {
+		dockerInput.Cmd = strings.Split(req.Cmd, " ")
 	}
 
-	_, _, err = cli.ImageInspectWithRaw(ctx, containerImage)
+	_, _, err = p.client.ImageInspectWithRaw(ctx, req.Image)
 	if err != nil {
 		if client.IsErrNotFound(err) {
 			pullOpt := types.ImagePullOptions{}
-			if input.RegistryCred != "" {
-				pullOpt.RegistryAuth = input.RegistryCred
+			if req.RegistryCred != "" {
+				pullOpt.RegistryAuth = req.RegistryCred
 			}
-			pull, err := cli.ImagePull(ctx, dockerInput.Image, pullOpt)
+			pull, err := p.client.ImagePull(ctx, req.Image, pullOpt)
 			if err != nil {
 				return nil, err
 			}
@@ -149,26 +187,34 @@ func RunContainer(ctx context.Context, containerImage string, input RequestConta
 
 	hostConfig := &container.HostConfig{
 		PortBindings: exposedPortMap,
+		Mounts:       req.Mounts,
 	}
 
-	resp, err := cli.ContainerCreate(ctx, dockerInput, hostConfig, nil, "")
+	resp, err := p.client.ContainerCreate(ctx, dockerInput, hostConfig, nil, "")
 	if err != nil {
 		return nil, err
 	}
-	if err := cli.ContainerStart(ctx, resp.ID, types.ContainerStartOptions{}); err != nil {
-		return nil, err
-	}
-	containerInstance := &Container{
-		ID:     resp.ID,
-		client: cli,
+
+	c := &DockerContainer{
+		ID:         resp.ID,
+		WaitingFor: req.WaitingFor,
+		sessionID:  sessionID,
+		provider:   p,
 	}
 
-	// if a WaitStrategy has been specified, wait before returning
-	if input.WaitingFor != nil {
-		if err := input.WaitingFor.WaitUntilReady(ctx, containerInstance); err != nil {
-			// return containerInstance for termination
-			return containerInstance, err
-		}
+	return c, nil
+}
+
+// RunContainer takes a RequestContainer as input and it runs a container via the docker sdk
+func (p *DockerProvider) RunContainer(ctx context.Context, req ContainerRequest) (Container, error) {
+	c, err := p.CreateContainer(ctx, req)
+	if err != nil {
+		return nil, err
 	}
-	return containerInstance, nil
+
+	if err := c.Start(ctx); err != nil {
+		return c, errors.Wrap(err, "could not start container")
+	}
+
+	return c, nil
 }
